@@ -38,7 +38,7 @@ FSU1A maintains a persistent, real-time connection to the Betfair Exchange Strea
 | GCP project | `chiops` |
 | GCP region | `europe-west2` (London — mandatory, Betfair UK/IE geo-restriction) |
 | Cloud Run service | `fsu1a` |
-| Service account | `fsu1a@chiops.iam.gserviceaccount.com` |
+| Service account | `fsu1asa@chiops.iam.gserviceaccount.com` |
 | Port | `8080` |
 
 ### What FSU1A does
@@ -151,7 +151,7 @@ fsu1a/
 | GCP project | `chiops` |
 | Region | `europe-west2` (London) |
 | Service | Cloud Run — `fsu1a` |
-| Service account | `fsu1a@chiops.iam.gserviceaccount.com` |
+| Service account | `fsu1asa@chiops.iam.gserviceaccount.com` |
 | Container port | `8080` |
 | Min instances | `1` (stream must be persistent; cold start loses the socket) |
 | Concurrency | `80` (default; all endpoints are in-memory reads) |
@@ -980,7 +980,7 @@ The `asyncio.Lock` in `MarketCache` serialises all writes. Since the stream clie
 
 ## 14. IAM & Permissions
 
-The Cloud Run service account `fsu1a@chiops.iam.gserviceaccount.com` requires:
+The Cloud Run service account `fsu1asa@chiops.iam.gserviceaccount.com` requires:
 
 | Role | Resource | Purpose |
 |---|---|---|
@@ -993,12 +993,12 @@ The Cloud Run service account `fsu1a@chiops.iam.gserviceaccount.com` requires:
 ```bash
 # Secret Manager
 gcloud projects add-iam-policy-binding chiops \
-  --member="serviceAccount:fsu1a@chiops.iam.gserviceaccount.com" \
+  --member="serviceAccount:fsu1asa@chiops.iam.gserviceaccount.com" \
   --role="roles/secretmanager.secretAccessor"
 
 # Firestore
 gcloud projects add-iam-policy-binding chiops \
-  --member="serviceAccount:fsu1a@chiops.iam.gserviceaccount.com" \
+  --member="serviceAccount:fsu1asa@chiops.iam.gserviceaccount.com" \
   --role="roles/datastore.user"
 ```
 
@@ -1021,7 +1021,7 @@ gcloud run deploy fsu1a \
   --image europe-west2-docker.pkg.dev/chiops/images/fsu1a:latest \
   --region europe-west2 \
   --project chiops \
-  --service-account fsu1a@chiops.iam.gserviceaccount.com \
+  --service-account fsu1asa@chiops.iam.gserviceaccount.com \
   --port 8080 \
   --min-instances 1 \
   --max-instances 3 \
