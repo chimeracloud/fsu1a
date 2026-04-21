@@ -2,7 +2,22 @@
 
 **Chimera Sports Trading Platform · Federated Service Unit 1A**
 
-FSU1A maintains a persistent, real-time connection to the Betfair Exchange Streaming API (ESA) and serves fully-reconstructed market state from in-memory cache to all downstream Chimera consumers. It replaces on-demand REST polling with a single pub/sub stream per deployment, providing sub-second market data without Betfair API rate-limit pressure.
+FSU1A maintains a persistent, real-time connection to the Betfair Exchange Streaming API (ESA) and serves fully-reconstructed market state from in-memory RAM to all downstream Chimera consumers. It replaces on-demand REST polling with a single pub/sub stream per deployment, providing sub-second market data without Betfair API rate-limit pressure.
+
+---
+
+## Live Deployment Status
+
+| Property | Value |
+|---|---|
+| **Service URL** | `https://fsu1a-991649774709.europe-west2.run.app` |
+| **Health** | `healthy` |
+| **Stream** | `connected` |
+| **Markets in cache** | `98` (live, as of first deploy 2026-04-21) |
+| **Reconnects** | `0` |
+| **Errors** | `0` |
+| **Latency indicator** | `false` |
+| **First deployed** | `2026-04-21` |
 
 ---
 
@@ -10,20 +25,23 @@ FSU1A maintains a persistent, real-time connection to the Betfair Exchange Strea
 
 1. [Overview](#1-overview)
 2. [Architecture](#2-architecture)
-3. [Repository Structure](#3-repository-structure)
-4. [GCP Deployment Target](#4-gcp-deployment-target)
-5. [Configuration](#5-configuration)
-6. [Secrets](#6-secrets)
-7. [Betfair Streaming Protocol](#7-betfair-streaming-protocol)
-8. [Market State & Delta Reconstruction](#8-market-state--delta-reconstruction)
-9. [API Reference — /api/*](#9-api-reference----api)
-10. [Admin Reference — /admin/*](#10-admin-reference----admin)
-11. [Observability Reference](#11-observability-reference)
-12. [Data Models](#12-data-models)
-13. [Error Handling & Resilience](#13-error-handling--resilience)
-14. [IAM & Permissions](#14-iam--permissions)
-15. [Deployment](#15-deployment)
-16. [Local Development](#16-local-development)
+3. [In-Memory Cache — What It Is](#4-in-memory-cache--what-it-is)
+4. [Repository Structure](#4-repository-structure)
+5. [GCP Deployment Target](#5-gcp-deployment-target)
+6. [Runtime Specifications](#6-runtime-specifications)
+7. [Configuration](#7-configuration)
+8. [Secrets](#8-secrets)
+9. [Betfair Streaming Protocol](#9-betfair-streaming-protocol)
+10. [Market State & Delta Reconstruction](#10-market-state--delta-reconstruction)
+11. [API Reference — /api/*](#11-api-reference----api)
+12. [Admin Reference — /admin/*](#12-admin-reference----admin)
+13. [Observability Reference](#13-observability-reference)
+14. [Data Models](#14-data-models)
+15. [Error Handling & Resilience](#15-error-handling--resilience)
+16. [Known Issues & Fixes](#16-known-issues--fixes)
+17. [IAM & Permissions](#17-iam--permissions)
+18. [Deployment](#18-deployment)
+19. [Local Development](#19-local-development)
 
 ---
 
@@ -34,7 +52,7 @@ FSU1A maintains a persistent, real-time connection to the Betfair Exchange Strea
 | Service name | `fsu1a` |
 | Platform | Chimera Sports Trading |
 | Runtime | Python 3.12 / FastAPI / Uvicorn |
-| Transport | Betfair Exchange Streaming API (TLS socket, not REST) |
+| Transport | Betfair Exchange Streaming API (raw TLS socket — not REST, not WebSocket) |
 | GCP project | `chiops` |
 | GCP region | `europe-west2` (London — mandatory, Betfair UK/IE geo-restriction) |
 | Cloud Run service | `fsu1a` |
@@ -45,7 +63,7 @@ FSU1A maintains a persistent, real-time connection to the Betfair Exchange Strea
 
 1. Authenticates with Betfair using a self-signed SSL client certificate (non-interactive bot login).
 2. Opens a persistent TLS socket to `stream-api.betfair.com:443` and subscribes to markets.
-3. Receives a continuous stream of JSON delta messages and reconstructs full market state in-memory.
+3. Receives a continuous stream of JSON delta messages and reconstructs full market state in container RAM.
 4. Serves that state synchronously to HTTP consumers — **zero on-demand Betfair REST calls at request time**.
 5. Automatically reconnects with exponential backoff on any failure, supplying re-subscription tokens so Betfair sends only the delta since last disconnect rather than a full image.
 6. Exposes operational endpoints for the Lay Engine, admin endpoints for Chimera Portal, and standard observability endpoints.
@@ -53,8 +71,9 @@ FSU1A maintains a persistent, real-time connection to the Betfair Exchange Strea
 ### What FSU1A does not do
 
 - It does not place bets or interact with the Betfair Betting API.
-- It does not replicate how the Lay Engine previously connected to Betfair. The Lay Engine's REST client is the problem being replaced, not a pattern to follow.
 - It does not poll Betfair at request time. All `/api/*` responses are served from in-memory state.
+- It does not persist market data to disk, Firestore, or any bucket — it is a **live feed**, not a recorder.
+- It does not replicate how the Lay Engine previously connected to Betfair. The Lay Engine's REST client is the problem being replaced, not a pattern to follow.
 
 ---
 
@@ -62,7 +81,7 @@ FSU1A maintains a persistent, real-time connection to the Betfair Exchange Strea
 
 ```
                         ┌─────────────────────────────────────────────────────┐
-                        │                    FSU1A (Cloud Run)                 │
+                        │              FSU1A (Cloud Run, europe-west2)         │
                         │                                                       │
   stream-api            │  TLS socket    ┌──────────────────┐                  │
   .betfair.com:443 ────►│───────────────►│  stream_client   │                  │
@@ -73,8 +92,8 @@ FSU1A maintains a persistent, real-time connection to the Betfair Exchange Strea
                         │                         │ delta messages              │
                         │                         ▼                             │
                         │                ┌──────────────────┐                  │
-                        │                │  market_cache    │                  │
-                        │                │  (in-memory)     │                  │
+                        │                │  market_cache    │  ← Container RAM  │
+                        │                │  (Python dict)   │    ~5–20MB live   │
                         │                └────────┬─────────┘                  │
                         │                         │                             │
                         │          ┌──────────────┼──────────────┐             │
@@ -83,7 +102,7 @@ FSU1A maintains a persistent, real-time connection to the Betfair Exchange Strea
                         └──────────┬──────────────┬──────────────┬─────────────┘
                                    │              │              │
                               Lay Engine    Chimera Portal   Cloud Run
-                              + other FSUs               health checks
+                              + other FSUs               health checks / Prometheus
 ```
 
 ### Key design decisions
@@ -91,22 +110,66 @@ FSU1A maintains a persistent, real-time connection to the Betfair Exchange Strea
 | Decision | Rationale |
 |---|---|
 | TLS socket (not WebSocket) | Betfair ESA is a raw TLS stream, not WebSocket |
-| Client cert only for `certlogin` | The streaming socket authenticates via session token in the auth message, not mTLS |
-| Single asyncio loop | All I/O non-blocking; no threads needed for the stream |
+| Client cert only for `certlogin` | Streaming socket authenticates via session token in the JSON auth message, not mTLS |
+| Single asyncio event loop | All I/O non-blocking; no threads needed for the stream |
 | `asyncio.Lock` on session | Prevents concurrent reconnects racing to acquire a new session token |
 | `asyncio.Lock` on cache | Serialises all market state mutations within the event loop |
+| 10MB readline buffer | Betfair `SUB_IMAGE` responses exceed asyncio's 64KB default — raised to 10MB |
 | New Firestore client per call | Cloud Run best practice for connection lifecycle management |
 | Temp files for cert/key | `requests` library requires file paths; module-level refs prevent GC |
-| `deque(maxlen=10000)` for logs | Bounded ring buffer; same limit as FSU1E |
+| `deque(maxlen=10000)` for logs | Bounded ring buffer matching FSU1E pattern |
+| `min-instances=1` on Cloud Run | Stream is persistent — a cold start would lose the socket and all cached state |
 
 ---
 
-## 3. Repository Structure
+## 3. In-Memory Cache — What It Is
+
+FSU1A stores all live market data in **container RAM** — plain Python objects (`dict`, `dataclass`) inside the running Cloud Run process. There is no database, no bucket, no external store involved.
+
+```
+Betfair stream deltas
+        │
+        ▼
+market_cache.py  ←── Python dict in RAM
+  └── MarketState (per market)
+        └── RunnerState (per runner)
+              ├── batb / batl  (level-based price ladders)
+              ├── atb / atl    (full price-point ladders)
+              ├── trd          (traded volume ladder)
+              └── ltp / tv / spn / spf  (scalars)
+        │
+        ▼
+HTTP response (served directly from above dict — zero I/O)
+```
+
+### Characteristics
+
+| Property | Value |
+|---|---|
+| **Location** | Container RAM (Cloud Run instance) |
+| **Current size** | ~98 markets, estimated 5–20MB RAM |
+| **Read latency** | Sub-millisecond (pure in-memory dict lookup) |
+| **Persistence** | None — cache rebuilds from Betfair on container restart (seconds) |
+| **Shared state** | Within one container instance only |
+| **Update frequency** | Continuous — every Betfair delta immediately applied |
+
+### As a data source
+
+Because FSU1A is always running (min-instances=1) and the stream is always connected, the in-memory cache is effectively a **continuously updated live snapshot** of every subscribed market. This makes it a practical replacement for a dedicated data recorder for live pricing — no need to run a separate process just to keep Betfair data current.
+
+What it does **not** provide:
+- Historical tick data or replay
+- Persistence across restarts (though rebuild is fast)
+- Multi-instance shared state (each Cloud Run instance has its own cache)
+
+---
+
+## 4. Repository Structure
 
 ```
 fsu1a/
 ├── Dockerfile                  # python:3.12-slim, port 8080
-├── requirements.txt            # Pinned dependencies (mirrors FSU1E)
+├── requirements.txt            # Pinned dependencies
 ├── docs/
 │   └── Betfair API Docs.pdf    # Official ESA specification (authoritative)
 └── app/
@@ -144,7 +207,7 @@ fsu1a/
 
 ---
 
-## 4. GCP Deployment Target
+## 5. GCP Deployment Target
 
 | Setting | Value |
 |---|---|
@@ -152,17 +215,65 @@ fsu1a/
 | Region | `europe-west2` (London) |
 | Service | Cloud Run — `fsu1a` |
 | Service account | `fsu1asa@chiops.iam.gserviceaccount.com` |
+| Service URL | `https://fsu1a-991649774709.europe-west2.run.app` |
 | Container port | `8080` |
-| Min instances | `1` (stream must be persistent; cold start loses the socket) |
-| Concurrency | `80` (default; all endpoints are in-memory reads) |
+| Min instances | `1` |
+| Max instances | `3` |
+| Memory | `512Mi` |
+| CPU | `1` |
+| Concurrency | `80` |
+| Authentication | Required (GCP identity token) |
+| Firestore database | `(default)` in `europe-west2` |
+| Artifact Registry | `europe-west2-docker.pkg.dev/chiops/images/fsu1a` |
 
-> **Region is non-negotiable.** Betfair restricts ESA access to IP ranges in the UK/IE. Deploying outside `europe-west2` will result in TLS connection refusals from `stream-api.betfair.com`.
+> **Region is non-negotiable.** Betfair restricts ESA access to UK/IE IP ranges. Deploying outside `europe-west2` results in TLS connection refusals from `stream-api.betfair.com`.
+
+> **Min instances = 1 is non-negotiable.** The Betfair stream is a persistent TCP connection. If the instance scales to zero the socket closes, the cache is lost, and all downstream consumers get stale or empty data. At min=1 the stream is always live.
 
 ---
 
-## 5. Configuration
+## 6. Runtime Specifications
 
-FSU1A reads its configuration from a Firestore document at startup and applies it to `AppState`. The document is the single source of truth; FSU1A is the sole writer.
+### Dependencies (`requirements.txt`)
+
+| Package | Version | Purpose |
+|---|---|---|
+| `fastapi` | `0.115.0` | HTTP framework |
+| `uvicorn[standard]` | `0.30.6` | ASGI server |
+| `google-cloud-firestore` | `2.19.0` | Settings persistence |
+| `google-cloud-secret-manager` | `2.21.1` | Credential storage |
+| `requests` | `2.32.3` | Betfair cert login (sync HTTP) |
+| `pydantic` | `2.9.2` | Data validation |
+| `sse-starlette` | `2.1.3` | Server-Sent Events for admin stream |
+
+### Background tasks (always running)
+
+| Task | Purpose | Interval |
+|---|---|---|
+| `betfair_stream` | Main ESA socket loop — read, parse, apply deltas | Continuous |
+| `betfair_keepalive` | POST keepalive to Betfair REST session endpoint | Every 20h (configurable) |
+| `betfair_maintenance` | Evict CLOSED markets from RAM cache | Every 5 minutes |
+
+### Startup sequence
+
+```
+1. Load settings from Firestore (auto-bootstrap if missing)
+2. Fetch all 5 secrets from Secret Manager → cache in module RAM
+3. Write cert/key PEM to temp files (for requests library)
+4. Start background tasks (stream, keepalive, maintenance)
+5. POST to identitysso-cert.betfair.com → acquire session token
+6. Open TLS socket to stream-api.betfair.com:443
+7. Send op=authentication → wait for SUCCESS
+8. Send op=marketSubscription → wait for SUCCESS
+9. Begin reading MCM deltas → populate market_cache
+10. HTTP server ready to serve /api/* from RAM
+```
+
+---
+
+## 7. Configuration
+
+FSU1A reads its configuration from a Firestore document at startup. FSU1A is the **sole writer** to this document.
 
 ### Firestore path
 
@@ -176,136 +287,112 @@ Document   : fsu1a
 | Field | Type | Default | Min | Max | Description |
 |---|---|---|---|---|---|
 | `mode` | enum | `active` | — | — | Operating mode: `active`, `paused`, `drain` |
-| `heartbeat_ms` | int | `5000` | `1000` | `30000` | ESA heartbeat interval in milliseconds |
-| `reconnect_max_backoff_s` | int | `300` | `10` | `3600` | Maximum reconnect backoff in seconds |
+| `heartbeat_ms` | int | `5000` | `1000` | `30000` | ESA heartbeat interval (ms) |
+| `reconnect_max_backoff_s` | int | `300` | `10` | `3600` | Max reconnect backoff (s) |
 | `session_keepalive_hours` | int | `20` | `1` | `23` | Hours between Betfair session keepalive calls |
-| `market_filter_event_type_ids` | list[str] | `["1","2","4717"]` | — | — | Betfair event type IDs to subscribe (1=Horse Racing, 2=Football, 4717=Tennis) |
+| `market_filter_event_type_ids` | list[str] | `["1","2","4717"]` | — | — | Event type IDs (1=Horse Racing, 2=Football, 4717=Tennis) |
 | `market_filter_country_codes` | list[str] | `["GB","IE"]` | — | — | Country codes to subscribe |
 | `market_filter_market_types` | list[str] | `["WIN","PLACE","MATCH_ODDS","NEXT_GOAL"]` | — | — | Market types to subscribe |
 | `max_markets` | int | `200` | `1` | `1000` | Maximum markets held in cache |
 | `log_level` | enum | `INFO` | — | — | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| `version` | int | `0` | — | — | Auto-incremented on every write (do not set manually) |
-
-### Auto-bootstrap
-
-If the Firestore document does not exist when FSU1A starts, it is created with all default values. This allows a fresh deployment to become operational without manual Firestore setup.
+| `version` | int | `0` | — | — | Auto-incremented on every write |
 
 ### Mode semantics
 
 | Mode | Behaviour |
 |---|---|
-| `active` | Normal operation — stream connected, all endpoints serving |
-| `paused` | Stream client continues running but `/health` reports `degraded` |
-| `drain` | `/health` reports `draining`; use before scaling down to allow Lay Engine to stop sending requests |
+| `active` | Normal — stream connected, all endpoints serving |
+| `paused` | Stream continues but `/health` reports `degraded` |
+| `drain` | `/health` reports `draining` — use before scaling down |
+
+### Auto-bootstrap
+
+If the Firestore document does not exist at startup, FSU1A creates it with all default values. No manual Firestore setup required on first deploy.
 
 ---
 
-## 6. Secrets
+## 8. Secrets
 
-All credentials are stored in **Google Secret Manager** under the `chiops` project. FSU1A fetches all five secrets at startup and caches them in memory for the process lifetime.
+All credentials are stored in **Google Secret Manager** under the `chiops` project. FSU1A fetches all five at startup and caches them in RAM for the process lifetime.
 
-| Secret ID | Content | Format |
+| Secret ID (the name) | Content | Format |
 |---|---|---|
 | `betfair-username` | Betfair account username | Plain string |
 | `betfair-password` | Betfair account password | Plain string |
 | `betfair-app-key` | Betfair paid API application key | Plain string |
-| `betfair-cert-pem` | Self-signed SSL client certificate | PEM string (includes `-----BEGIN CERTIFICATE-----`) |
-| `betfair-key-pem` | Private key for the client certificate | PEM string (includes `-----BEGIN RSA PRIVATE KEY-----` or EC equivalent) |
+| `betfair-cert-pem` | Self-signed SSL client certificate | PEM string |
+| `betfair-key-pem` | Private key for the client certificate | PEM string |
 
-FSU1A always fetches `versions/latest`. To rotate a credential, create a new secret version; the change takes effect on the next process restart.
+FSU1A always fetches `versions/latest`. To rotate a credential, add a new secret version — takes effect on next container restart.
 
-### Cert/key temp files
+### Credential flow
 
-The `requests` library requires file paths rather than in-memory strings for SSL client certificates. At startup, `secrets.py` writes the PEM values to `tempfile.NamedTemporaryFile(delete=False)` instances. The file objects are held as module-level variables so they are not garbage-collected during the process lifetime. The OS cleans them up when the process exits.
-
-### Secret access pattern
-
-```python
-# secrets.py — module-level cache, fetched once
-_cached: dict | None = None
-
-def get_credentials() -> dict:
-    global _cached
-    if _cached is not None:
-        return _cached
-    # ... fetch from Secret Manager, write temp files ...
-    _cached = { "username": ..., "app_key": ..., "cert_path": ..., ... }
-    return _cached
+```
+Secret Manager
+  └── get_credentials() [once, cached in RAM]
+        ├── username / password / app_key  → used in cert login POST
+        └── cert_pem / key_pem             → written to temp files
+                                              → used by requests as cert=(path, path)
 ```
 
 Credentials are **never** hardcoded, logged, or included in API responses.
 
+### Populating secrets (one-time setup)
+
+```bash
+echo -n "your_username" | gcloud secrets versions add betfair-username --data-file=- --project chiops
+echo -n "your_password" | gcloud secrets versions add betfair-password --data-file=- --project chiops
+echo -n "your_app_key"  | gcloud secrets versions add betfair-app-key  --data-file=- --project chiops
+cat betfair_cert.pem    | gcloud secrets versions add betfair-cert-pem --data-file=- --project chiops
+cat betfair_key.pem     | gcloud secrets versions add betfair-key-pem  --data-file=- --project chiops
+```
+
 ---
 
-## 7. Betfair Streaming Protocol
-
-This section documents how FSU1A implements the Betfair Exchange Streaming API specification.
+## 9. Betfair Streaming Protocol
 
 ### Transport
 
-- Host: `stream-api.betfair.com`
-- Port: `443`
-- Protocol: Raw TLS (not WebSocket, not HTTP)
-- Message framing: JSON objects terminated by `\r\n`
-- Client cert: **Not used on the streaming socket** — standard server-auth TLS only
-- Authentication on the socket: Done via the `op=authentication` JSON message after the TCP/TLS handshake
+| Property | Value |
+|---|---|
+| Host | `stream-api.betfair.com` |
+| Port | `443` |
+| Protocol | Raw TLS (not WebSocket, not HTTP) |
+| Message framing | JSON objects terminated by `\r\n` |
+| Read buffer | 10MB (raised from asyncio 64KB default — see §16) |
+| Client cert | Not on the stream socket — standard server-auth TLS only |
+| Authentication | Via `op=authentication` JSON message after TLS handshake |
 
 ### Connection lifecycle
 
 ```
 Client                                    Server (stream-api.betfair.com:443)
-  │                                              │
-  │──── TLS handshake ──────────────────────────►│
-  │                                              │
-  │◄─── {"op":"connection","connectionId":"..."} │  Server speaks first
-  │                                              │
-  │──── {"op":"authentication",                  │
-  │      "id":1,                                 │
-  │      "appKey":"...",                         │
-  │      "session":"..."}                        │
-  │                                              │
-  │◄─── {"op":"status","id":1,                   │
-  │      "statusCode":"SUCCESS",                 │
-  │      "connectionClosed":false}               │
-  │                                              │
-  │──── {"op":"marketSubscription",              │
-  │      "id":2,                                 │
-  │      "marketFilter":{...},                   │
-  │      "marketDataFilter":{"fields":[...]},    │  Optionally: "initialClk", "clk"
-  │      "initialClk":"...", "clk":"..."}        │
-  │                                              │
-  │◄─── {"op":"status","id":2,                   │
-  │      "statusCode":"SUCCESS",...}             │
-  │                                              │
-  │◄─── {"op":"mcm","ct":"SUB_IMAGE",...}        │  Full initial image
-  │◄─── {"op":"mcm","ct":null,...}               │  Ongoing deltas
-  │◄─── {"op":"mcm","ct":"HEARTBEAT"}            │  Keepalive (no market data)
-  │                  ...                         │
+  │──── TLS handshake ──────────────────►│
+  │◄─── {"op":"connection","connectionId":"..."} ─────────── Server speaks first
+  │──── {"op":"authentication","appKey":"...","session":"..."} ──────────────►│
+  │◄─── {"op":"status","statusCode":"SUCCESS"} ──────────────────────────────│
+  │──── {"op":"marketSubscription","marketFilter":{...},"initialClk":"..."} ►│
+  │◄─── {"op":"status","statusCode":"SUCCESS"} ──────────────────────────────│
+  │◄─── {"op":"mcm","ct":"SUB_IMAGE",...} ─── Full initial image ────────────│
+  │◄─── {"op":"mcm","ct":null,...} ────────── Ongoing deltas ────────────────│
+  │◄─── {"op":"mcm","ct":"HEARTBEAT"} ─────── Keepalive (no data) ───────────│
 ```
 
 ### Session token (certlogin)
-
-Before connecting to the stream, FSU1A acquires a session token via:
 
 ```
 POST https://identitysso-cert.betfair.com/api/certlogin
 Content-Type: application/x-www-form-urlencoded
 X-Application: <app-key>
-[TLS client certificate in request]
+[TLS client certificate attached]
 
-username=<username>&password=<password>
+username=...&password=...
+→ {"loginStatus": "SUCCESS", "sessionToken": "abc123"}
 ```
-
-Response:
-```json
-{"loginStatus": "SUCCESS", "sessionToken": "abc123..."}
-```
-
-The `sessionToken` is then included in the `op=authentication` message on the streaming socket.
 
 ### Session keepalive
 
-UK/IE Betfair sessions expire after 24 hours. FSU1A sends a keepalive every `session_keepalive_hours` (default 20):
+UK/IE sessions expire after 24h. FSU1A keepalives every 20h (configurable):
 
 ```
 POST https://identitysso.betfair.com/api/keepAlive
@@ -315,140 +402,83 @@ X-Authentication: <session-token>
 
 ### Subscribed market data fields
 
-| Field constant | Data provided |
+| Field constant | Data delivered |
 |---|---|
-| `EX_BEST_OFFERS` | `batb`, `batl` (best available level-based ladders) |
-| `EX_TRADED` | `trd` (traded volume price-point ladder) |
-| `EX_TRADED_VOL` | `tv` (total traded volume scalar) |
-| `EX_LTP` | `ltp` (last traded price scalar) |
-| `EX_MARKET_DEF` | `marketDefinition` (market and runner metadata) |
-| `SP_PROJECTED` | `spn`, `spf` (SP near/far projected prices) |
+| `EX_BEST_OFFERS` | `batb`, `batl` — best 3 levels each side |
+| `EX_TRADED` | `trd` — traded volume at each price |
+| `EX_TRADED_VOL` | `tv` — total matched volume scalar |
+| `EX_LTP` | `ltp` — last traded price scalar |
+| `EX_MARKET_DEF` | `marketDefinition` — market and runner metadata |
+| `SP_PROJECTED` | `spn`, `spf` — SP near/far projections |
 
-### Heartbeat and dead connection detection
+### Heartbeat & dead connection detection
 
-- The server sends `op=mcm` messages (including `ct=HEARTBEAT` messages when no market data has changed) at the interval negotiated by `heartbeat_ms`.
-- If **no message of any kind** arrives within `2 × heartbeat_ms` seconds, the connection is considered dead.
-- FSU1A closes the socket and initiates reconnect.
+- Server sends messages at `heartbeat_ms` interval (default 5000ms)
+- If no message in `2 × heartbeat_ms` → connection declared dead → reconnect
 
 ### Status 503
 
-A `"status": 503` field inside an MCM message is a **latency indicator**, not an error. It means the server is experiencing high load and may be conflating updates. FSU1A:
-
-1. Sets `app_state.stream_latency = True`
-2. Logs a warning
-3. **Does not disconnect**
-4. Clears the flag when the next non-503 MCM arrives
+`"status": 503` inside an MCM = high latency indicator. FSU1A sets `stream_latency=True` and **continues reading** — does not disconnect.
 
 ### Segmentation
 
-Large market images are split into segments. Each MCM message has a `segmentType` field:
-
-| `segmentType` | Meaning |
-|---|---|
-| `SEG_START` | First segment of a multi-part message |
-| `SEG` | Middle segment |
-| `SEG_END` | Final segment |
-| `null` (absent) | Non-segmented message |
-
-FSU1A applies deltas from **every** segment immediately. The `clk` and `initialClk` re-subscription tokens are only updated on `SEG_END` or non-segmented messages.
+Large market images split into segments (`SEG_START` / `SEG` / `SEG_END`). Deltas applied from every segment immediately. `clk` tokens updated only on `SEG_END` or non-segmented messages.
 
 ### Re-subscription (clk tokens)
 
-After any successful subscription, FSU1A stores `initialClk` and `clk` from MCM messages. On reconnect, these are included in the `op=marketSubscription` message:
-
-```json
-{
-  "op": "marketSubscription",
-  "id": 3,
-  "marketFilter": {...},
-  "marketDataFilter": {"fields": [...]},
-  "initialClk": "abc...",
-  "clk": "xyz..."
-}
-```
-
-The server responds with `ct=RESUB_DELTA` (delta since last known position) instead of `ct=SUB_IMAGE` (full image), dramatically reducing reconnect latency and bandwidth.
-
-If the tokens are stale or rejected, the server falls back to `ct=SUB_IMAGE` automatically — no special handling needed.
+On reconnect, FSU1A supplies stored `initialClk` + `clk` → Betfair sends `RESUB_DELTA` (patch only) instead of full `SUB_IMAGE`, minimising reconnect latency.
 
 ---
 
-## 8. Market State & Delta Reconstruction
+## 10. Market State & Delta Reconstruction
 
 ### Level-based ladders
 
-Used for: `batb` (best available to back), `batl` (best available to lay), `bdatb`, `bdatl`.
+Used for: `batb`, `batl`, `bdatb`, `bdatl`
 
-Each update in the stream is a triple `[level, price, size]`:
-- **Keyed by level** (integer). Level 0 = best price on that side.
-- `size == 0` → remove that level from the dict.
-- The ladder dict is `{level: [price, size], ...}`.
-
-To read best 3 lay prices: `[ladder[lvl] for lvl in sorted(ladder)[:3]]`
+```
+Each update: [level, price, size]
+Stored as:   dict[int → [price, size]]
+Level 0 = best. size==0 → remove that level.
+```
 
 ### Price-point ladders
 
-Used for: `atb` (full available to back), `atl` (full available to lay), `trd` (traded), `spb`, `spl`.
+Used for: `atb`, `atl`, `trd`, `spb`, `spl`
 
-Each update is a pair `[price, size]`:
-- **Keyed by price** (float).
-- `size == 0` → remove that price from the dict.
-- The ladder dict is `{price: size, ...}`.
-
-### Scalar fields
-
-`ltp`, `tv`, `spn`, `spf` — sent only when changed; absence means the previous value is still valid.
+```
+Each update: [price, size]
+Stored as:   dict[float → size]
+size==0 → remove that price.
+```
 
 ### Full image (`img=True`)
 
-When a `MarketChange` has `"img": true`, FSU1A clears the entire `MarketState` for that market before applying the new data. This happens on initial subscription (`ct=SUB_IMAGE`) and after any period where Betfair could not guarantee delta integrity.
-
-### Runner change sp sub-object
-
-```json
-"sp": {
-  "spn": 4.5,
-  "spf": 5.2,
-  "bsp": 4.8,
-  "spb": [[4.0, 200.0], [4.5, 0]],
-  "spl": [[5.0, 100.0]]
-}
-```
-
-- `spn`, `spf`, `bsp` — scalars, update when present
-- `spb`, `spl` — price-point ladders, same delta rules as `atb`/`atl`
-
-### Market definition sync
-
-When `marketDefinition` is present in a `MarketChange`, runner status is synced from `marketDefinition.runners[].status` alongside the `RunnerChange` deltas.
+When a `MarketChange` has `"img": true`, FSU1A clears the entire `MarketState` for that market before applying new data. Happens on initial subscription and after any integrity gap.
 
 ### CLOSED market eviction
 
-FSU1A runs a background task every 5 minutes that removes markets whose `marketDefinition.status == "CLOSED"` from the in-memory cache.
+Background task runs every 5 minutes. Any market whose `marketDefinition.status == "CLOSED"` is removed from the RAM cache.
 
 ---
 
-## 9. API Reference — `/api/*`
+## 11. API Reference — `/api/*`
 
-All endpoints serve from in-memory state. No Betfair API calls are made at request time. All responses are `application/json`.
+All endpoints serve from RAM. Zero Betfair API calls at request time.
 
 ---
 
 ### `GET /api/markets`
 
-List all markets currently in the cache.
+List all markets in cache. Optional query filters:
 
-**Query parameters:**
-
-| Parameter | Type | Description |
+| Param | Type | Example |
 |---|---|---|
-| `event_type_id` | string | Filter by Betfair event type ID (e.g. `"1"` for horse racing) |
-| `status` | string | Filter by market status (`OPEN`, `SUSPENDED`, `CLOSED`) |
-| `in_play` | boolean | Filter to in-play (`true`) or pre-race (`false`) markets |
-| `market_type` | string | Filter by market type (`WIN`, `MATCH_ODDS`, etc.) |
-| `country_code` | string | Filter by country code (`GB`, `IE`) |
-
-**Response `200`:**
+| `event_type_id` | string | `"1"` (Horse Racing) |
+| `status` | string | `"OPEN"` |
+| `in_play` | boolean | `true` |
+| `market_type` | string | `"WIN"` |
+| `country_code` | string | `"GB"` |
 
 ```json
 {
@@ -462,16 +492,15 @@ List all markets currently in the cache.
       "countryCode": "GB",
       "venue": "Ascot",
       "name": "14:30 Ascot",
-      "marketTime": "2026-04-19T13:30:00Z",
-      "suspendTime": "2026-04-19T13:30:00Z",
+      "marketTime": "2026-04-21T13:30:00Z",
       "totalMatched": 125432.50,
       "inPlay": false,
       "bspMarket": false,
       "runnerCount": 8,
-      "lastUpdateAt": "2026-04-19T13:28:45.123456+00:00"
+      "lastUpdateAt": "2026-04-21T13:28:45.123456+00:00"
     }
   ],
-  "count": 1
+  "count": 98
 }
 ```
 
@@ -481,40 +510,13 @@ List all markets currently in the cache.
 
 Single market with runner prices (best 3 levels each side).
 
-**Path parameter:** `market_id` — Betfair market ID (e.g. `1.234567890`)
-
-**Response `200`:** Market summary fields (see above) plus:
-
-```json
-{
-  "marketId": "1.234567890",
-  "...": "...summary fields...",
-  "runners": [
-    {
-      "selectionId": 12345678,
-      "handicap": 0.0,
-      "status": "ACTIVE",
-      "lastPriceTraded": 4.5,
-      "totalMatched": 15432.10,
-      "spNear": null,
-      "spFar": null,
-      "spActual": null,
-      "bestAvailableToBack": [[5.0, 200.50], [4.8, 150.00], [4.6, 100.00]],
-      "bestAvailableToLay":  [[4.5, 50.00],  [4.6, 80.00],  [4.8, 120.00]]
-    }
-  ]
-}
-```
-
-**Response `404`:** Market not in cache (not yet received from stream, or evicted after closing).
+**404** if market not in cache.
 
 ---
 
-### `GET /api/markets/{market_id}/prices`
+### `GET /api/markets/{market_id}/prices` ⭐ Primary Lay Engine endpoint
 
-**Primary endpoint consumed by the Lay Engine.** Compact runner prices, best 3 levels each side.
-
-**Response `200`:**
+Compact runner prices. Best 3 levels of `batl`/`batb` per runner.
 
 ```json
 {
@@ -539,366 +541,98 @@ Single market with runner prices (best 3 levels each side).
 }
 ```
 
-**Price array format:** `[price, size]` — price is the Betfair decimal odds, size is the matched/available amount in GBP.
-
-**Ordering:**
+**Price arrays:** `[price, size]` — decimal odds and GBP amount.
 - `bestAvailableToBack`: level 0 first = highest price (best for backer)
 - `bestAvailableToLay`: level 0 first = lowest price (best for layer)
-
-**Response `404`:** Market not in cache.
 
 ---
 
 ### `GET /api/markets/{market_id}/book`
 
-Full order book — all price points for every runner, plus raw `marketDefinition`.
-
-**Response `200`:**
-
-```json
-{
-  "marketId": "1.234567890",
-  "status": "OPEN",
-  "inPlay": false,
-  "totalMatched": 125432.50,
-  "marketDefinition": { "...": "raw marketDefinition object from ESA" },
-  "runners": [
-    {
-      "selectionId": 12345678,
-      "handicap": 0.0,
-      "status": "ACTIVE",
-      "lastPriceTraded": 4.5,
-      "totalMatched": 15432.10,
-      "spNear": null,
-      "spFar": null,
-      "spActual": null,
-      "bestAvailableToBack": [[5.0, 200.50], [4.8, 150.00], [4.6, 100.00]],
-      "bestAvailableToLay":  [[4.5, 50.00],  [4.6, 80.00],  [4.8, 120.00]],
-      "availableToBack": [[5.0, 200.50], [4.8, 150.00], ...],
-      "availableToLay":  [[4.5, 50.00],  [4.6, 80.00],  ...],
-      "traded":          [[3.5, 5000.00], [4.0, 8000.00], ...]
-    }
-  ]
-}
-```
-
-`availableToBack` is sorted descending by price. `availableToLay` and `traded` are sorted ascending by price.
-
-**Response `404`:** Market not in cache.
+Full order book — all price points, traded ladder, raw `marketDefinition`.
 
 ---
 
 ### `GET /api/stream/status`
 
-Current streaming connection state. Useful for Lay Engine health checks before placing requests.
-
-**Response `200`:**
-
 ```json
 {
   "status": "connected",
-  "connectionId": "001-220419-1234",
+  "connectionId": "101-210426080137-1262744",
   "latencyIndicator": false,
-  "lastMessageAt": "2026-04-19T13:28:45.123456+00:00",
+  "lastMessageAt": "2026-04-21T08:05:29.454881+00:00",
   "reconnectCount": 0,
-  "marketCount": 87
-}
-```
-
-`status` values: `disconnected` | `connecting` | `connected` | `reconnecting`
-
----
-
-## 10. Admin Reference — `/admin/*`
-
-All admin endpoints follow **CHI-ADR-010**. They return structured form definitions rather than raw values so Chimera Portal can render edit UI without bespoke per-FSU knowledge.
-
----
-
-### `GET /admin/health`
-
-Portal header widget liveness check.
-
-```json
-{
-  "service": "fsu1a",
-  "version": "1.0.0",
-  "health": "healthy",
-  "mode": "active",
-  "streamStatus": "connected"
-}
-```
-
-`health` values: `healthy` | `degraded` | `draining` | `unhealthy`
-
----
-
-### `GET /admin/status`
-
-Full runtime snapshot.
-
-```json
-{
-  "service": "fsu1a",
-  "version": "1.0.0",
-  "health": "healthy",
-  "mode": "active",
-  "stream": {
-    "status": "connected",
-    "connectionId": "001-220419-1234",
-    "latencyIndicator": false,
-    "lastMessageAt": "2026-04-19T13:28:45.123456+00:00",
-    "reconnectCount": 0,
-    "marketCount": 87
-  },
-  "session": {
-    "acquiredAt": "2026-04-19T06:00:00.000000+00:00"
-  },
-  "requests": {
-    "total": 14523,
-    "errors": 0,
-    "errorRate": 0.0
-  }
+  "marketCount": 98
 }
 ```
 
 ---
 
-### `GET /admin/settings`
+## 12. Admin Reference — `/admin/*`
 
-Returns a **structured form definition** (CHI-ADR-010 format).
+All endpoints follow **CHI-ADR-010** — structured form definitions, not raw values.
 
-```json
-{
-  "service": "fsu1a",
-  "version": 3,
-  "fields": [
-    {
-      "name": "mode",
-      "label": "Operating mode",
-      "value": "active",
-      "type": "enum",
-      "options": ["active", "paused", "drain"]
-    },
-    {
-      "name": "heartbeat_ms",
-      "label": "Heartbeat interval (ms)",
-      "value": 5000,
-      "type": "int",
-      "min": 1000,
-      "max": 30000
-    },
-    {
-      "name": "market_filter_event_type_ids",
-      "label": "Event type IDs to subscribe",
-      "value": ["1", "2", "4717"],
-      "type": "list_str"
-    }
-  ]
-}
-```
-
----
-
-### `PUT /admin/settings`
-
-Apply a partial settings update. Returns an `applied`/`rejected` split.
-
-**Request body:** Partial key/value map of settings to change.
-
-```json
-{
-  "mode": "paused",
-  "heartbeat_ms": 10000,
-  "unknown_field": "ignored"
-}
-```
-
-**Response `200`:**
-
-```json
-{
-  "applied": {
-    "mode": "paused",
-    "heartbeat_ms": 10000
-  },
-  "rejected": {
-    "unknown_field": "'unknown_field' is not an editable field"
-  },
-  "version": 4
-}
-```
-
-Changes are persisted to Firestore immediately. `AppState` is updated in-memory. A `settings_updated` event is broadcast to all SSE subscribers.
-
----
-
-### `GET /admin/config`
-
-Static schema — Portal uses this to build advanced editor views or validate client-side.
-
-```json
-{
-  "service": "fsu1a",
-  "version": "1.0.0",
-  "editableFields": ["mode", "heartbeat_ms", "..."],
-  "validationRules": {
-    "mode": {"type": "enum", "values": ["active", "paused", "drain"], "label": "..."},
-    "heartbeat_ms": {"type": "int", "min": 1000, "max": 30000, "label": "..."}
-  },
-  "defaults": { "mode": "active", "heartbeat_ms": 5000, "..." : "..." }
-}
-```
-
----
-
-### `GET /admin/logs`
-
-Paginated structured log ring-buffer (last 10,000 entries).
-
-**Query parameters:** `limit` (default `100`), `offset` (default `0`).
-
-```json
-{
-  "logs": [
-    {
-      "timestamp": "2026-04-19T13:28:45.123456+00:00",
-      "level": "INFO",
-      "message": "Betfair session acquired"
-    }
-  ],
-  "total": 47,
-  "limit": 100,
-  "offset": 0
-}
-```
-
----
-
-### `GET /admin/stream`
-
-**Server-Sent Events** stream of real-time admin events. Connect with `EventSource` in the Portal.
-
-- Content-Type: `text/event-stream`
-- Keepalive: SSE comment every 15 seconds if no event
-- Each event `data` field is a JSON-encoded object
-
-**Event types:**
-
-| `type` | When sent | Additional fields |
+| Endpoint | Method | Purpose |
 |---|---|---|
-| `stream_status` | Connection state changes | `status` |
+| `/admin/health` | GET | Portal header widget liveness |
+| `/admin/status` | GET | Full runtime snapshot |
+| `/admin/settings` | GET | Structured form definition of editable settings |
+| `/admin/settings` | PUT | Apply validated updates → applied/rejected split |
+| `/admin/config` | GET | Static schema (validation rules, defaults) |
+| `/admin/logs` | GET | Paginated log ring-buffer (last 10,000 entries) |
+| `/admin/stream` | GET | SSE stream of real-time admin events (15s keepalive) |
+
+### SSE event types (`/admin/stream`)
+
+| `type` | Trigger | Extra fields |
+|---|---|---|
+| `stream_status` | Connection state change | `status` |
 | `mcm` | Market data received | `changeType`, `marketCount`, `latency` |
-| `settings_updated` | Admin settings changed | `fields` (list of changed keys) |
-
-**Example SSE frames:**
-```
-data: {"type": "stream_status", "status": "connected"}
-
-data: {"type": "mcm", "changeType": "SUB_IMAGE", "marketCount": 87, "latency": false}
-
-data: {"type": "settings_updated", "fields": ["mode"]}
-
-: keepalive
-```
+| `settings_updated` | Admin settings changed | `fields` |
 
 ---
 
-## 11. Observability Reference
+## 13. Observability Reference
 
----
+| Endpoint | Method | Purpose | Health condition |
+|---|---|---|---|
+| `/health` | GET | Liveness probe | `200` if healthy/degraded/draining; `503` if disconnected |
+| `/ready` | GET | Readiness probe | `503` while stream in initial `disconnected` state |
+| `/info` | GET | Static metadata | Always `200` |
+| `/status` | GET | Full runtime snapshot | Always `200` |
+| `/metrics` | GET | Prometheus text format | Always `200` |
 
-### `GET /health`
+### Health values
 
-Liveness probe. Returns `200` if the service can handle requests; `503` if critically unhealthy.
-
-```json
-{"status": "healthy", "service": "fsu1a"}
-```
-
-| `status` | HTTP | Meaning |
+| `health` | HTTP | Meaning |
 |---|---|---|
 | `healthy` | 200 | Stream connected, no latency flag |
 | `degraded` | 200 | Connecting or reconnecting |
-| `draining` | 200 | Mode set to `drain` |
-| `unhealthy` | 503 | Disconnected and not attempting to reconnect |
+| `draining` | 200 | Mode = `drain` |
+| `unhealthy` | 503 | Disconnected and not reconnecting |
+
+### Prometheus metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `fsu1a_stream_connected` | gauge | `1` if stream connected |
+| `fsu1a_stream_latency` | gauge | `1` if status 503 latency indicator active |
+| `fsu1a_market_count` | gauge | Markets in RAM cache |
+| `fsu1a_http_requests_total` | counter | Total HTTP requests |
+| `fsu1a_http_errors_total` | counter | Total HTTP 5xx responses |
+| `fsu1a_stream_reconnects_total` | counter | Total stream reconnect attempts |
 
 ---
 
-### `GET /ready`
+## 14. Data Models
 
-Readiness probe. Returns `503` while the stream is in initial `disconnected` state (before first connect attempt completes).
+### RunnerState (internal RAM)
 
-```json
-{"ready": true}
-```
-
----
-
-### `GET /info`
-
-Static service metadata. Useful for service registry / inventory tooling.
-
-```json
-{
-  "service": "fsu1a",
-  "version": "1.0.0",
-  "project": "chiops",
-  "region": "europe-west2",
-  "startedAt": "2026-04-19T06:00:00.000000+00:00",
-  "uptimeSeconds": 27045.3
-}
-```
-
----
-
-### `GET /status`
-
-Full runtime snapshot (same as `/admin/status`, available without admin auth for monitoring tools).
-
----
-
-### `GET /metrics`
-
-Prometheus text exposition format (`text/plain; version=0.0.4`).
-
-```
-# HELP fsu1a_stream_connected Stream connected (1=yes 0=no)
-# TYPE fsu1a_stream_connected gauge
-fsu1a_stream_connected 1
-
-# HELP fsu1a_stream_latency Stream 503 latency indicator (1=yes)
-# TYPE fsu1a_stream_latency gauge
-fsu1a_stream_latency 0
-
-# HELP fsu1a_market_count Markets in in-memory cache
-# TYPE fsu1a_market_count gauge
-fsu1a_market_count 87
-
-# HELP fsu1a_http_requests_total Total HTTP requests received
-# TYPE fsu1a_http_requests_total counter
-fsu1a_http_requests_total 14523
-
-# HELP fsu1a_http_errors_total Total HTTP 5xx responses
-# TYPE fsu1a_http_errors_total counter
-fsu1a_http_errors_total 0
-
-# HELP fsu1a_stream_reconnects_total Total stream reconnect attempts
-# TYPE fsu1a_stream_reconnects_total counter
-fsu1a_stream_reconnects_total 0
-```
-
----
-
-## 12. Data Models
-
-### RunnerState (internal)
-
-| Field | Type | Source | Notes |
+| Field | Type | Source ESA field | Notes |
 |---|---|---|---|
-| `selection_id` | int | `rc.id` | Betfair runner selection ID |
-| `handicap` | float | `rc.hc` | Asian handicap (0.0 for non-handicap) |
-| `status` | str | `marketDefinition.runners[].status` | `ACTIVE`, `WINNER`, `LOSER`, `REMOVED`, `HIDDEN` |
+| `selection_id` | int | `rc.id` | Betfair runner ID |
+| `handicap` | float | `rc.hc` | 0.0 for non-handicap markets |
+| `status` | str | `marketDefinition.runners[].status` | `ACTIVE`, `WINNER`, `LOSER`, `REMOVED` |
 | `batb` | dict[int→[float,float]] | `rc.batb` | Best available to back (level-based) |
 | `batl` | dict[int→[float,float]] | `rc.batl` | Best available to lay (level-based) |
 | `bdatb` | dict[int→[float,float]] | `rc.bdatb` | Best display ATB |
@@ -910,103 +644,114 @@ fsu1a_stream_reconnects_total 0
 | `spl` | dict[float→float] | `rc.sp.spl` | SP lay bets placed |
 | `ltp` | float\|None | `rc.ltp` | Last traded price |
 | `tv` | float\|None | `rc.tv` | Total traded volume |
-| `spn` | float\|None | `rc.sp.spn` / `rc.spn` | SP near projected |
-| `spf` | float\|None | `rc.sp.spf` / `rc.spf` | SP far projected |
+| `spn` | float\|None | `rc.sp.spn` | SP near projected |
+| `spf` | float\|None | `rc.sp.spf` | SP far projected |
 | `bsp` | float\|None | `rc.sp.bsp` | Calculated BSP |
-
-### MarketState (internal)
-
-| Field | Type | Source | Notes |
-|---|---|---|---|
-| `market_id` | str | `mc.id` | Betfair market ID |
-| `market_definition` | dict | `mc.marketDefinition` | Full Betfair MarketDefinition object |
-| `runners` | dict[int→RunnerState] | `mc.rc[]` | Keyed by selection_id |
-| `status` | str\|None | `mc.status` | Override status (rare) |
-| `total_volume` | float\|None | `mc.tv` | Market total matched |
-| `last_update_at` | datetime | Internal | UTC timestamp of last delta applied |
 
 ### Market name construction
 
-Betfair's streaming API does not provide a pre-formatted market name. FSU1A constructs one as:
-
+Betfair streaming does not provide a formatted name. FSU1A constructs:
 ```
-"{HH:MM} {venue}"   e.g. "14:30 Ascot"
+"{HH:MM} {venue}"   →  "14:30 Ascot"
 ```
-
-from `marketDefinition.marketTime` (ISO 8601) and `marketDefinition.venue`. Falls back to `"{venue} {marketType}"` or the raw `marketId` if fields are missing.
+from `marketDefinition.marketTime` + `marketDefinition.venue`. Falls back to `"{venue} {marketType}"` or raw `marketId`.
 
 ---
 
-## 13. Error Handling & Resilience
+## 15. Error Handling & Resilience
 
-### Stream reconnect
+### Stream reconnect table
 
 | Event | Response |
 |---|---|
-| TCP/TLS error | Close writer, begin backoff wait, reconnect |
-| Heartbeat timeout (2× `heartbeat_ms`) | Same as above |
-| `op=status` with `errorCode=INVALID_SESSION_INFORMATION` | Clear session token, force new certlogin, reconnect |
-| `op=status` with `errorCode=MAX_CONNECTION_LIMIT_EXCEEDED` | Same as above |
-| `status=503` in MCM | Set `stream_latency=True`, continue reading — do NOT disconnect |
-| Server sends `RESUB_DELTA` rejection (stale clk) | Server falls back to `SUB_IMAGE` automatically — no special handling |
-| Auth rejected at reconnect | `refresh_session()` forces a new cert login before attempting stream auth |
+| TCP/TLS error | Close socket, begin backoff, reconnect |
+| Heartbeat timeout (2× `heartbeat_ms`) | Same |
+| `errorCode=INVALID_SESSION_INFORMATION` | Clear session token, force new certlogin, reconnect |
+| `errorCode=MAX_CONNECTION_LIMIT_EXCEEDED` | Same |
+| `status=503` in MCM | Set `stream_latency=True`, **continue reading** |
+| Stale clk tokens on resubscription | Server auto-falls back to `SUB_IMAGE` — no special handling |
+| Auth rejected at reconnect | `refresh_session()` forces new cert login before next stream auth |
 
 ### Backoff schedule
 
 ```
-Attempt 1 : wait 1s
-Attempt 2 : wait 2s
-Attempt 3 : wait 4s
-Attempt 4 : wait 8s
-...
-Attempt N : wait min(2^(N-1), reconnect_max_backoff_s)
+Attempt 1 → wait 1s
+Attempt 2 → wait 2s
+Attempt 3 → wait 4s
+Attempt N → wait min(2^(N-1), reconnect_max_backoff_s)
+Default cap: 300s
 ```
 
-Default cap: `300s` (5 minutes). Configurable via `reconnect_max_backoff_s`.
+### Startup failures
 
-### Settings load failure
-
-If Firestore is unavailable at startup, FSU1A logs the error and proceeds with `DEFAULT_SETTINGS` hardcoded in `config.py`. The stream will still connect; settings can be loaded at next restart.
-
-### Credentials load failure
-
-If Secret Manager is unavailable at startup, FSU1A logs the error and continues. The stream loop will fail to authenticate and will retry with backoff, so the service self-heals when Secret Manager becomes available.
-
-### Cache consistency
-
-The `asyncio.Lock` in `MarketCache` serialises all writes. Since the stream client and HTTP handlers share the same event loop, reads from HTTP handlers never see a partial write — the lock ensures atomicity at the asyncio task level.
+| Failure | Behaviour |
+|---|---|
+| Firestore unavailable | Log error, proceed with `DEFAULT_SETTINGS` — stream still starts |
+| Secret Manager unavailable | Log error, continue — stream will retry with backoff until secrets load |
+| Betfair cert login fails | Retry with backoff — service self-heals |
 
 ---
 
-## 14. IAM & Permissions
+## 16. Known Issues & Fixes
 
-The Cloud Run service account `fsu1asa@chiops.iam.gserviceaccount.com` requires:
+### asyncio readline buffer — `ValueError: chunk exceed the limit` (fixed v1.0.1)
 
-| Role | Resource | Purpose |
+**Symptom:** Stream connects and authenticates but immediately disconnects with:
+```
+ValueError: Separator is not found, and chunk exceed the limit
+```
+
+**Root cause:** asyncio's `StreamReader` has a default read limit of 64KB. Betfair's initial `SUB_IMAGE` response (containing all runner and market definition data for every subscribed market) easily exceeds this.
+
+**Fix:** `asyncio.open_connection()` called with `limit=10 * 1024 * 1024` (10MB):
+```python
+reader, writer = await asyncio.open_connection(
+    BETFAIR_STREAM_HOST, BETFAIR_STREAM_PORT, ssl=ssl_ctx,
+    limit=10 * 1024 * 1024,
+)
+```
+
+**Deployed:** `2026-04-21` in commit `ae08f95`.
+
+---
+
+## 17. IAM & Permissions
+
+### Service account: `fsu1asa@chiops.iam.gserviceaccount.com`
+
+| Role | Display name | Purpose |
 |---|---|---|
-| `roles/secretmanager.secretAccessor` | `chiops` project | Read Betfair credentials from Secret Manager |
-| `roles/datastore.user` | `chiops` project | Read/write `fsu-admin-settings/fsu1a` Firestore document |
-| `roles/run.invoker` | (not needed externally if VPC-internal) | Allow Lay Engine to call `/api/*` |
+| `roles/secretmanager.secretAccessor` | Secret Manager Secret Accessor | Read Betfair credentials |
+| `roles/datastore.user` | Datastore User | Read/write Firestore settings document |
 
-### Granting access (gcloud commands)
+### Granting access
 
 ```bash
-# Secret Manager
 gcloud projects add-iam-policy-binding chiops \
   --member="serviceAccount:fsu1asa@chiops.iam.gserviceaccount.com" \
   --role="roles/secretmanager.secretAccessor"
 
-# Firestore
 gcloud projects add-iam-policy-binding chiops \
   --member="serviceAccount:fsu1asa@chiops.iam.gserviceaccount.com" \
   --role="roles/datastore.user"
 ```
 
+### Granting downstream callers access to FSU1A
+
+```bash
+# Example — Lay Engine service account
+gcloud run services add-iam-policy-binding fsu1a \
+  --region europe-west2 \
+  --project chiops \
+  --member="serviceAccount:lay-engine@chiops.iam.gserviceaccount.com" \
+  --role="roles/run.invoker"
+```
+
 ---
 
-## 15. Deployment
+## 18. Deployment
 
-### Build and push container image
+### Build and push container
 
 ```bash
 gcloud builds submit \
@@ -1025,77 +770,55 @@ gcloud run deploy fsu1a \
   --port 8080 \
   --min-instances 1 \
   --max-instances 3 \
-  --concurrency 80 \
   --memory 512Mi \
   --cpu 1 \
   --no-allow-unauthenticated
 ```
 
-> `--min-instances 1` is **required**. The Betfair stream is a persistent connection — if the instance scales to zero, the socket closes and market data goes stale. At min=1 the stream is always live.
-
-> `--no-allow-unauthenticated` restricts access to authenticated GCP identities (Lay Engine, Portal service accounts). If deploying behind an internal load balancer this can be omitted.
-
-### Secret Manager — provision secrets
+### Verify after deploy
 
 ```bash
-# Create each secret (run once)
-for SECRET in betfair-username betfair-password betfair-app-key betfair-cert-pem betfair-key-pem; do
-  gcloud secrets create "$SECRET" --project chiops --replication-policy automatic
-done
+TOKEN=$(gcloud auth print-identity-token)
+URL=https://fsu1a-991649774709.europe-west2.run.app
 
-# Add secret versions (supply actual values)
-echo -n "your_username"    | gcloud secrets versions add betfair-username   --data-file=- --project chiops
-echo -n "your_password"    | gcloud secrets versions add betfair-password   --data-file=- --project chiops
-echo -n "your_app_key"     | gcloud secrets versions add betfair-app-key    --data-file=- --project chiops
-cat betfair_cert.pem       | gcloud secrets versions add betfair-cert-pem   --data-file=- --project chiops
-cat betfair_key.pem        | gcloud secrets versions add betfair-key-pem    --data-file=- --project chiops
+curl -s -H "Authorization: Bearer $TOKEN" $URL/health
+curl -s -H "Authorization: Bearer $TOKEN" $URL/status | python3 -m json.tool
 ```
 
 ---
 
-## 16. Local Development
+## 19. Local Development
 
 ### Prerequisites
 
 - Python 3.12
-- A GCP project with Application Default Credentials: `gcloud auth application-default login`
-- Betfair credentials provisioned in Secret Manager (or mock them locally)
+- `gcloud auth application-default login` (ADC for Firestore + Secret Manager)
+- Betfair credentials in Secret Manager (or mock locally)
 
-### Install dependencies
+### Install and run
 
 ```bash
 pip install -r requirements.txt
-```
-
-### Run locally
-
-```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
 ```
 
-On startup, FSU1A will:
-1. Attempt to load settings from Firestore (`chiops/fsu-admin-settings/fsu1a`)
-2. Attempt to load credentials from Secret Manager
-3. Open the Betfair stream
-
-If you don't have real credentials, the stream connection will fail and retry. All HTTP endpoints that read from `market_cache` will return empty results (no 500 errors) — the cache simply has no markets yet.
-
-### Endpoints during local development
+### Useful local endpoints
 
 | URL | Purpose |
 |---|---|
-| `http://localhost:8080/docs` | FastAPI auto-generated Swagger UI |
-| `http://localhost:8080/status` | Runtime state snapshot |
+| `http://localhost:8080/docs` | Swagger UI |
+| `http://localhost:8080/status` | Runtime state |
 | `http://localhost:8080/api/markets` | Market list (empty until stream connects) |
-| `http://localhost:8080/admin/stream` | SSE event feed (open in `curl -N`) |
+| `http://localhost:8080/metrics` | Prometheus metrics |
+| `http://localhost:8080/admin/logs` | Structured log buffer |
 
-### Testing the SSE stream
+### Test the SSE admin stream
 
 ```bash
 curl -N http://localhost:8080/admin/stream
 ```
 
-### Build and test the container locally
+### Build and run as container
 
 ```bash
 docker build -t fsu1a:local .
