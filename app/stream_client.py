@@ -177,8 +177,10 @@ async def _run_connection() -> None:
 
     ssl_ctx = ssl.create_default_context()
     # The streaming socket uses standard server-auth TLS — no client cert.
+    # limit=10MB: asyncio default (64KB) is too small for Betfair SUB_IMAGE responses.
     reader, writer = await asyncio.open_connection(
-        BETFAIR_STREAM_HOST, BETFAIR_STREAM_PORT, ssl=ssl_ctx
+        BETFAIR_STREAM_HOST, BETFAIR_STREAM_PORT, ssl=ssl_ctx,
+        limit=10 * 1024 * 1024,
     )
 
     try:
